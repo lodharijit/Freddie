@@ -2,6 +2,7 @@ import unittest
 import numpy as np
 import pandas as pd
 from datetime import date
+import concurrent.futures
 
 from btc_trading_simulation import (
     generate_btc_prices,
@@ -78,6 +79,129 @@ class TestBitcoinTradingSimulation(unittest.TestCase):
         # Bought 10 BTC at 120 for 1200 cash. Sold 10 BTC at 90 = 900 cash.
         self.assertAlmostEqual(df_res.loc[4]['Cash'], 900.0)
         self.assertAlmostEqual(df_res.loc[4]['Portfolio_Value'], 900.0)
+
+    def test_race_condition_reproduction(self):
+        """Minimal reproduction test verifying thread safety and deterministic price generation under concurrent execution."""
+        seed_target = 42
+        expected_df = generate_btc_prices(days=30, seed=seed_target)
+        expected_prices = expected_df['Price'].tolist()
+
+        def worker(idx):
+            seed = seed_target if idx % 2 == 0 else (999 + idx)
+            df = generate_btc_prices(days=30, seed=seed)
+            return seed, df['Price'].tolist()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(worker, i) for i in range(30)]
+            results = [f.result() for f in futures]
+
+        for seed, prices in results:
+            if seed == seed_target:
+                self.assertEqual(prices, expected_prices)
+
+    def test_concurrent_execution(self):
+        """Regression test for parallel pipeline execution across multiple threads."""
+        def run_full_pipeline(seed):
+            df = generate_btc_prices(days=60, seed=seed)
+            df_ma = calculate_moving_averages(df)
+            df_strat, trades = simulate_golden_cross_strategy(df_ma)
+            return len(df_strat), len(trades)
+
+        seeds = [10, 20, 30, 40, 50, 10, 20, 30, 40, 50]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(run_full_pipeline, s) for s in seeds]
+            results = [f.result() for f in futures]
+
+        self.assertEqual(len(results), len(seeds))
+        for row_count, trade_count in results:
+            self.assertEqual(row_count, 60)
+            self.assertGreaterEqual(trade_count, 0)
+
+    def test_retry_behavior(self):
+        """Regression test verifying that failed thread tasks can be retried cleanly without corrupted state."""
+        attempts = 0
+
+        def flaky_task(seed):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ValueError("Transient network/processing failure")
+            df = generate_btc_prices(days=20, seed=seed)
+            return df['Price'].tolist()
+
+        # First attempt fails
+        with self.assertRaises(ValueError):
+            flaky_task(100)
+
+        # Retry attempt succeeds and matches expected output
+        retry_prices = flaky_task(100)
+        expected_prices = generate_btc_prices(days=20, seed=100)['Price'].tolist()
+        self.assertEqual(retry_prices, expected_prices)
+
+    def test_failure_handling(self):
+        """Regression test ensuring worker thread exceptions do not corrupt state or crash other thread jobs."""
+        def task(i):
+            if i % 3 == 0:
+                raise RuntimeError(f"Simulated failure in worker {i}")
+            df = generate_btc_prices(days=15, seed=i)
+            return df['Price'].iloc[0]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {i: executor.submit(task, i) for i in range(12)}
+            succeeded = 0
+            failed = 0
+            for i, fut in futures.items():
+                if i % 3 == 0:
+                    with self.assertRaises(RuntimeError):
+                        fut.result()
+                    failed += 1
+                else:
+                    res = fut.result()
+                    self.assertEqual(res, 60000.0)
+                    succeeded += 1
+
+        self.assertEqual(failed, 4)
+        self.assertEqual(succeeded, 8)
+
+    def test_cancellation_handling(self):
+        """Regression test ensuring pending thread tasks can be cancelled without lingering state side-effects."""
+        def slow_task(seed):
+            import time
+            time.sleep(0.05)
+            return generate_btc_prices(days=10, seed=seed)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            f1 = executor.submit(slow_task, 1)
+            f2 = executor.submit(slow_task, 2)
+            f3 = executor.submit(slow_task, 3)
+
+            cancelled_f3 = f3.cancel()
+            self.assertTrue(cancelled_f3)
+            self.assertTrue(f3.cancelled())
+
+            res1 = f1.result()
+            res2 = f2.result()
+            self.assertEqual(len(res1), 10)
+            self.assertEqual(len(res2), 10)
+
+    def test_out_of_order_completion(self):
+        """Regression test verifying that tasks completing out-of-order maintain independent results."""
+        def variable_task(days, seed):
+            import time
+            # Tasks with more days sleep less so they finish out of order relative to submission order
+            time.sleep(0.01 * (100 - days))
+            df = generate_btc_prices(days=days, seed=seed)
+            return days, seed, df['Price'].tolist()
+
+        tasks = [(80, 10), (20, 20), (90, 30), (10, 40)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(variable_task, d, s) for d, s in tasks]
+            completed_results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        self.assertEqual(len(completed_results), len(tasks))
+        for d, s, prices in completed_results:
+            expected = generate_btc_prices(days=d, seed=s)['Price'].tolist()
+            self.assertEqual(prices, expected)
 
 if __name__ == '__main__':
     unittest.main()

@@ -16,12 +16,12 @@ def generate_btc_prices(days=60, start_price=60000.0, mu=0.10, sigma=0.65, seed=
     Returns:
         pd.DataFrame: DataFrame containing Day, Date, and Price columns.
     """
-    np.random.seed(seed)
+    rng = np.random.RandomState(seed)
     dt = 1 / 365.0  # Daily time step for 365 days/year crypto market
 
     # Geometric Brownian Motion formula:
     # S_t = S_0 * exp(cumsum((mu - 0.5 * sigma^2)*dt + sigma * sqrt(dt) * Z_t))
-    daily_returns = np.random.normal(
+    daily_returns = rng.normal(
         (mu - 0.5 * sigma ** 2) * dt,
         sigma * np.sqrt(dt),
         size=days
