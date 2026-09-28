@@ -2,6 +2,7 @@ import unittest
 import numpy as np
 import pandas as pd
 from datetime import date
+import concurrent.futures
 
 from btc_trading_simulation import (
     generate_btc_prices,
@@ -78,6 +79,29 @@ class TestBitcoinTradingSimulation(unittest.TestCase):
         # Bought 10 BTC at 120 for 1200 cash. Sold 10 BTC at 90 = 900 cash.
         self.assertAlmostEqual(df_res.loc[4]['Cash'], 900.0)
         self.assertAlmostEqual(df_res.loc[4]['Portfolio_Value'], 900.0)
+
+    def test_generate_btc_prices_concurrent_thread_safety(self):
+        """Verifies that concurrent calls with same/different seeds are deterministic and thread-safe."""
+        num_workers = 10
+        total_runs = 40
+        seed_target = 42
+
+        def run_sim(run_idx):
+            # Interleave seed_target with other seeds across threads
+            seed = seed_target if run_idx % 2 == 0 else 999
+            df = generate_btc_prices(days=100, seed=seed)
+            return run_idx, seed, df['Price'].tolist()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(run_sim, i) for i in range(total_runs)]
+            results = [f.result() for f in futures]
+
+        target_results = [prices for idx, seed, prices in results if seed == seed_target]
+        expected_prices = target_results[0]
+
+        # Verify all thread runs with seed 42 produced exact identical output
+        for prices in target_results[1:]:
+            self.assertEqual(prices, expected_prices)
 
 if __name__ == '__main__':
     unittest.main()
